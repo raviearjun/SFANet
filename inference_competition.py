@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from torch.utils import data
 from dataset_competition import DatasetCompetition
 from models import Model
@@ -9,6 +10,66 @@ import numpy as np
 from tqdm import tqdm
 import time
 
+def inference_with_tta(model, image, device, tta_transforms=['original', 'hflip']):
+    """
+    Perform test time augmentation on a single image
+    
+    Args:
+        model: trained model
+        image: input tensor [1, 3, H, W]
+        device: cuda device
+        tta_transforms: list of augmentations to apply
+    
+    Returns:
+        averaged prediction count
+    """
+    model.eval()
+    predictions = []
+    
+    with torch.no_grad():
+        for transform in tta_transforms:
+            if transform == 'original':
+                # Original image
+                aug_image = image
+            elif transform == 'hflip':
+                # Horizontal flip
+                aug_image = torch.flip(image, dims=[3])  # Flip width dimension
+            elif transform == 'scale_up':
+                # Scale up 10%
+                _, _, h, w = image.shape
+                new_h, new_w = int(h * 1.1), int(w * 1.1)
+                # Round to multiple of 16
+                new_h = round(new_h / 16) * 16
+                new_w = round(new_w / 16) * 16
+                aug_image = F.interpolate(image, size=(new_h, new_w), mode='bilinear', align_corners=False)
+            elif transform == 'scale_down':
+                # Scale down 10%
+                _, _, h, w = image.shape
+                new_h, new_w = int(h * 0.9), int(w * 0.9)
+                # Round to multiple of 16
+                new_h = round(new_h / 16) * 16
+                new_w = round(new_w / 16) * 16
+                aug_image = F.interpolate(image, size=(new_h, new_w), mode='bilinear', align_corners=False)
+            
+            # Forward pass
+            density_output, _ = model(aug_image)
+            
+            # Handle density map scaling for resized images
+            if transform in ['scale_up', 'scale_down']:
+                # Resize density map back to original scale for consistent counting
+                _, _, orig_h, orig_w = image.shape
+                # Density map is stride=2, so half the input size
+                target_h, target_w = orig_h // 2, orig_w // 2
+                density_output = F.interpolate(density_output, size=(target_h, target_w), 
+                                             mode='bilinear', align_corners=False)
+            
+            # Calculate count
+            pred_count = density_output.sum().item()
+            predictions.append(pred_count)
+    
+    # Return averaged prediction
+    return np.mean(predictions)
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_path', default='./dataset', type=str, help='path to competition dataset')
@@ -17,6 +78,10 @@ def main():
     parser.add_argument('--gpu', default=0, type=int, help='gpu id')
     parser.add_argument('--batch_size', default=1, type=int, help='batch size for inference')
     parser.add_argument('--checkpoint', default='best', choices=['best', 'latest'], help='which checkpoint to use')
+    parser.add_argument('--use_tta', default=False, action='store_true', help='use test time augmentation')
+    parser.add_argument('--tta_transforms', default=['original', 'hflip'], nargs='+', 
+                        choices=['original', 'hflip', 'scale_up', 'scale_down'],
+                        help='TTA transforms to apply')
     
     args = parser.parse_args()
     
@@ -24,6 +89,10 @@ def main():
     print(f"Dataset path: {args.data_path}")
     print(f"Checkpoint path: {args.save_path}")
     print(f"Output path: {args.output_path}")
+    print(f"Use TTA: {args.use_tta}")
+    if args.use_tta:
+        print(f"TTA transforms: {args.tta_transforms}")
+        print(f"Expected inference time multiplier: {len(args.tta_transforms)}x")
     
     # Setup device
     device = torch.device('cuda:' + str(args.gpu))
@@ -71,20 +140,33 @@ def main():
         for batch_idx, (images, filenames) in enumerate(tqdm(test_loader, desc="Processing")):
             images = images.to(device)
             
-            # Forward pass
-            density_output, attention_output = model(images)
-            
-            # Calculate predicted count
-            predicted_counts = density_output.sum(dim=(1, 2, 3))  # Sum over spatial dimensions
-            
-            # Store results
-            for i, filename in enumerate(filenames):
-                pred_count = predicted_counts[i].item()
-                predictions.append(pred_count)
-                image_ids.append(filename)
+            # Apply TTA or standard inference
+            if args.use_tta:
+                # TTA inference - process each image individually
+                for i, filename in enumerate(filenames):
+                    single_image = images[i:i+1]  # Keep batch dimension
+                    pred_count = inference_with_tta(model, single_image, device, args.tta_transforms)
+                    
+                    predictions.append(pred_count)
+                    image_ids.append(filename)
+                    
+                    if batch_idx < 5:  # Print first few predictions
+                        print(f"  {filename}: {pred_count:.2f} (TTA with {len(args.tta_transforms)} augmentations)")
+            else:
+                # Standard inference
+                density_output, attention_output = model(images)
                 
-                if batch_idx < 5:  # Print first few predictions
-                    print(f"  {filename}: {pred_count:.2f}")
+                # Calculate predicted count
+                predicted_counts = density_output.sum(dim=(1, 2, 3))  # Sum over spatial dimensions
+                
+                # Store results
+                for i, filename in enumerate(filenames):
+                    pred_count = predicted_counts[i].item()
+                    predictions.append(pred_count)
+                    image_ids.append(filename)
+                    
+                    if batch_idx < 5:  # Print first few predictions
+                        print(f"  {filename}: {pred_count:.2f}")
     
     inference_time = time.time() - start_time
     print(f"\nInference completed in {inference_time:.2f}s")
